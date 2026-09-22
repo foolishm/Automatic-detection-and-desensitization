@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+venv/
+.venv/
+env/
+ENV/
+.idea/
+.vscode/
+*.log
+
+# PyInstaller 产物（exe / pkg 超过 GitHub 100MB 限制，不要进仓库）
+build/
+dist/
+*.spec.bak

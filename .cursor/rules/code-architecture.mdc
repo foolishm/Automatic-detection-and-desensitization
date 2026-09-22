@@ -1,0 +1,17 @@
+---
+description: 以根目录《代码架构.md》为准，新增修改必须按该文档落地
+alwaysApply: true
+---
+
+# 代码架构
+
+架构正文：仓库根目录 `代码架构.md`（唯一说明）。新增、修改、修复前先读全文，并按该文档落点。
+
+硬性约束（细节以 `代码架构.md` 为准）：
+
+- 实现写在 `app/` 对应模块，`face_video_detector.py` 只再导出公开名字
+- UI 新方法放对应 Mixin，由 `FaceVideoApp` 继承
+- 运行时参数：`from app import settings as cfg`，禁止 `from app.settings import NAME` 快照
+- 弹窗：`from app.ui import dialogs as messagebox`，禁止 `tkinter.messagebox`
+- 测试只放 `tests/`，`import _bootstrap` 后 `import face_video_detector as f`
+- 新 `app.*` 子模块同步写入 `人脸脱敏率检测工具.spec` 的 `hiddenimports`
