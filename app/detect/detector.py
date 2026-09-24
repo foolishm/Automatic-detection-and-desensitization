@@ -4,8 +4,10 @@
 import os
 
 import cv2
+import numpy as np
 
 from app import settings as cfg
+from app.detect.mosaic import mask_mosaic
 
 
 class FaceDetector:
@@ -191,13 +193,22 @@ class FaceDetector:
             self._yunet_size = (w, h)
         return self._yunet
 
-    def detect_and_draw(self, frame_bgr):
+    def detect_and_draw(self, frame_bgr, mosaic_mask=None, skip_mosaic=False):
         """对一帧图像进行人脸检测并就地绘制标注。
 
         返回 (标注后的帧, 人脸框列表)。人脸框为 (x, y, w, h) 矩形。
+        mosaic_mask：调用方已算好的棋盘格掩码（预处理阶段复用），None 则内部现算。
+        skip_mosaic：True 时完全跳过马赛克定位与涂抹（原视频不检测马赛克，不看设置开关）。
         """
+        if skip_mosaic:
+            # 原视频：不做任何马赛克处理，直接在原帧上检测
+            work = frame_bgr
+        else:
+            # 预处理：把半透明棋盘格马赛克涂成纯色后再检测，防止透出的人脸被检出。
+            # 检测用 work（可能是涂抹后的副本），绘制仍落在 frame_bgr 上，保持预览画面不变。
+            work, _ = mask_mosaic(frame_bgr, mask=mosaic_mask)
         if self.backend == "haar":
-            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
             faces = self.cascade.detectMultiScale(gray, **cfg.HAAR_PARAMS)
             boxes = [tuple(int(v) for v in (x, y, w, h)) for (x, y, w, h) in faces]
             for i, (x, y, w, h) in enumerate(boxes, start=1):
@@ -213,16 +224,16 @@ class FaceDetector:
             return frame_bgr, boxes
 
         if self.backend == "yunet":
-            ih, iw = frame_bgr.shape[:2]
+            ih, iw = work.shape[:2]
             # 预处理缩放：开启时把帧缩放到指定宽度（高度等比），可加快检测/省 CPU
             if cfg.PREPROCESS_RESIZE_ENABLED and iw > cfg.PREPROCESS_RESIZE_WIDTH:
                 target_w = int(cfg.PREPROCESS_RESIZE_WIDTH)
                 target_h = max(1, int(ih * target_w / iw))
-                small = cv2.resize(frame_bgr, (target_w, target_h),
+                small = cv2.resize(work, (target_w, target_h),
                                    interpolation=cv2.INTER_AREA)
                 sw, sh = target_w, target_h
             else:
-                small = frame_bgr
+                small = work
                 sw, sh = iw, ih
 
             detector = self._get_yunet(sw, sh)
@@ -232,7 +243,7 @@ class FaceDetector:
             landmark_faces = []
             if cfg.FACIAL_LANDMARK_CHECK and faces is not None:
                 try:
-                    landmark_faces = self.facial_landmark_points(frame_bgr)
+                    landmark_faces = self.facial_landmark_points(work)
                 except Exception:
                     landmark_faces = []
             if faces is not None:
@@ -255,11 +266,10 @@ class FaceDetector:
                         if not self._box_has_landmark((cx, cy, cw, ch),
                                                       landmark_faces, cfg.LANDMARK_MIN_POINTS):
                             continue
-                    # 肤色校验（仅当开关开启 + 中大型框）：挡轮胎/车辆配件等肤色≈0 的误检；
-                    # 黑白画面应关闭开关；远处小人脸较小、肤色弱，跳过以免误杀。
-                    if cfg.SKIN_FILTER_ENABLED and min(cw, ch) >= cfg.SKIN_MIN_SIZE:
-                        if skin_ratio(frame_bgr, (cx, cy, cw, ch)) < cfg.SKIN_RATIO_THRESHOLD:
-                            continue
+                    # 肤色校验：中大框肤色不足就丢；小框只丢「几乎没肤色且很暗」的轮胎，
+                    # 避免误杀远处真人脸，也避免误杀仍透出的马赛克人脸（更亮）
+                    if _reject_by_skin(work, (cx, cy, cw, ch)):
+                        continue
                     boxes.append((cx, cy, cw, ch))
                     cv2.rectangle(frame_bgr, (cx, cy), (cx + cw, cy + ch),
                                   cfg.BOX_COLOR, cfg.BOX_THICKNESS)
@@ -275,11 +285,11 @@ class FaceDetector:
         import mediapipe as mp
         rgb_mp = mp.Image(
             image_format=mp.ImageFormat.SRGB,
-            data=cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB),
+            data=cv2.cvtColor(work, cv2.COLOR_BGR2RGB),
         )
         result = self.landmarker.detect(rgb_mp)
         boxes = []
-        ih, iw = frame_bgr.shape[:2]
+        ih, iw = work.shape[:2]
         if result.face_landmarks:
             for face_landmarks in result.face_landmarks:
                 # 计算关键点外接矩形
@@ -309,6 +319,37 @@ class FaceDetector:
         if self._scrfd_session is not None:
             self._scrfd_session = None
             self._scrfd_ready = None
+
+
+def _reject_by_skin(frame_bgr, box):
+    """肤色开关打开时，判断这个框要不要当成非人脸丢掉。"""
+    reject = False
+    if cfg.SKIN_FILTER_ENABLED:
+        ratio = skin_ratio(frame_bgr, box)
+        side = min(box[2], box[3])
+        # 中大框：肤色占比不够就丢
+        if side >= cfg.SKIN_MIN_SIZE:
+            reject = ratio < cfg.SKIN_RATIO_THRESHOLD
+        # 小框：只有又黑又没有肤色才丢，挡住车轮；有肤色的远处人脸、较亮的马赛克人脸留下
+        elif ratio < cfg.SKIN_DARK_RATIO and _region_value(frame_bgr, box) < cfg.SKIN_DARK_MAX:
+            reject = True
+    return reject
+
+
+def _region_value(frame_bgr, box):
+    """框内 HSV 亮度平均值。空框返回 255，避免被当成暗块。"""
+    value = 255.0
+    x, y, w, h = box
+    if w > 0 and h > 0:
+        h_img, w_img = frame_bgr.shape[:2]
+        x, y = max(0, x), max(0, y)
+        w = min(w, w_img - x)
+        h = min(h, h_img - y)
+        if w > 0 and h > 0:
+            roi = frame_bgr[y:y + h, x:x + w]
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            value = float(hsv[:, :, 2].mean())
+    return value
 
 
 def skin_ratio(frame_bgr, box):

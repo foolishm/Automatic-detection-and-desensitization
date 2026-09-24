@@ -122,6 +122,9 @@ class TitlebarMixin(object):
         user32.CallWindowProcW.restype = LRESULT
         old_proc = get_long(parent, GWL_WNDPROC)
 
+        WM_SYSCOMMAND = 0x0112
+        SC_RESTORE = 0xF120
+
         def _wndproc(h, msg, wp, lp):
             result = 0
             if msg == WM_DROPFILES:
@@ -132,6 +135,12 @@ class TitlebarMixin(object):
                     self._pending_drop_bad = True
                 result = 0
             else:
+                # 任务栏再次点击会发 SC_RESTORE；无标题栏时 Tk 经常停在最小化状态
+                if msg == WM_SYSCOMMAND and (int(wp) & 0xFFF0) == SC_RESTORE:
+                    try:
+                        self.root.after(0, self._restore_main_window)
+                    except Exception:
+                        pass
                 result = user32.CallWindowProcW(old_proc, h, msg, wp, lp)
             return result
 
@@ -192,7 +201,11 @@ class TitlebarMixin(object):
             d.ellipse([20, 20, 44, 44], fill=(16, 17, 23, 255))  # 内圈深色
 
             def on_show(icon, item):
-                self._restore_from_tray()
+                # 托盘回调在 pystray 线程，不能直接动 Tk
+                try:
+                    self.root.after(0, self._restore_from_tray)
+                except Exception:
+                    pass
 
             def on_quit(icon, item):
                 icon.stop()
@@ -210,11 +223,22 @@ class TitlebarMixin(object):
         except Exception:
             self._tray = None
 
-    def _restore_from_tray(self):
-        """从托盘恢复窗口：取消最小化并置顶。"""
-        self.root.deiconify()
+    def _restore_main_window(self):
+        """把主窗口从最小化或隐藏恢复到前台。必须在主线程调用。"""
+        # 已经在前台就不必再 deiconify，避免把正在拖动的窗口抖一下
+        if self.root.state() != "normal":
+            self.root.deiconify()
         self.root.lift()
-        self.root.focus_force()
+        try:
+            self.root.focus_force()
+        except Exception:
+            pass
+        return
+
+    def _restore_from_tray(self):
+        """从托盘恢复窗口。"""
+        self._restore_main_window()
+        return
 
     # ---------- 自绘深色标题栏 ----------
     def _build_titlebar(self):
@@ -382,8 +406,8 @@ class TitlebarMixin(object):
         return
 
     def _minimize(self):
-        # 最小化到托盘（隐藏窗口，通过托盘图标恢复）
-        self.root.withdraw()
+        # 最小化到任务栏。withdraw 会把按钮从任务栏拿掉，再点任务栏图标无法恢复。
+        self.root.iconify()
 
     def _close_titlebar(self):
         self._on_close()

@@ -35,6 +35,100 @@ def showwarning(title, message, parent=None, **kwargs):
     return _show(title, message, "warning", host)
 
 
+def open_saving(parent, on_cancel):
+    """「正在保存」提示。返回对话框，close() 关掉；点取消或关闭会调用 on_cancel。"""
+    dialog = _SavingDialog(parent, on_cancel)
+    return dialog
+
+
+class _SavingDialog(object):
+    """非阻塞的保存中弹窗，主线程仍能收到取消。"""
+
+    def __init__(self, parent, on_cancel):
+        self._on_cancel = on_cancel
+        self._closed = False
+        parent = _resolve_parent(parent)
+        win = tk.Toplevel(parent)
+        win.withdraw()
+        win.configure(bg=BG)
+        win.resizable(False, False)
+        win.overrideredirect(True)
+        # 有父窗口时挂到父窗口上
+        if parent is not None:
+            win.transient(parent)
+        win.attributes("-topmost", True)
+        self.win = win
+
+        header = tk.Frame(win, bg=BG_PANEL, height=36)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+        tk.Label(header, text="正在保存", bg=BG_PANEL, fg=FG,
+                 font=("Microsoft YaHei UI", 10, "bold")).pack(
+            side=tk.LEFT, padx=(14, 8))
+        close_btn = tk.Button(
+            header, text="✕", command=self._cancel,
+            bg=BG_PANEL, fg=FG, activebackground=ACCENT_RED,
+            activeforeground="#ffffff", relief=tk.FLAT, cursor="hand2",
+            font=("Microsoft YaHei UI", 10), padx=12, pady=2, bd=0,
+            highlightthickness=0, width=2)
+        close_btn.pack(side=tk.RIGHT)
+
+        tk.Frame(win, bg=ACCENT, height=2).pack(fill=tk.X)
+        body = tk.Frame(win, bg=BG)
+        body.pack(fill=tk.BOTH, expand=True, padx=18, pady=(16, 8))
+        tk.Label(
+            body, text="正在保存检测报告…", bg=BG, fg=FG,
+            font=("Microsoft YaHei UI", 10), justify="left", anchor="w").pack(fill=tk.X)
+
+        btn_row = tk.Frame(win, bg=BG)
+        btn_row.pack(fill=tk.X, padx=18, pady=(8, 16))
+        cancel_btn = tk.Button(
+            btn_row, text="取消", command=self._cancel,
+            bg=ACCENT, fg="#ffffff",
+            activebackground=ACCENT_HOVER, activeforeground="#ffffff",
+            relief=tk.FLAT, cursor="hand2",
+            font=("Microsoft YaHei UI", 10, "bold"),
+            padx=22, pady=6, bd=0, highlightthickness=1,
+            highlightbackground=BTN_ACCENT_BORDER, highlightcolor=BTN_ACCENT_BORDER)
+        cancel_btn.pack(side=tk.RIGHT)
+
+        win.bind("<Escape>", lambda _event: self._cancel())
+        win.update_idletasks()
+        height = max(win.winfo_reqheight(), 140)
+        _center_on_parent(win, parent, _DIALOG_WIDTH, height)
+        win.deiconify()
+        win.lift()
+        # 不 grab_set：模态抢焦点会把主窗口和任务栏还原一起锁死，取消也点不了
+        try:
+            cancel_btn.focus_set()
+        except Exception:
+            pass
+        return
+
+    def _cancel(self):
+        """通知调用方停写，并关掉提示。"""
+        callback = self._on_cancel
+        self.close()
+        # 先关窗再回调，避免回调里再关一次时序搅在一起
+        if callback is not None:
+            callback()
+        return
+
+    def close(self):
+        """关掉提示。重复调用无副作用。"""
+        if not self._closed:
+            self._closed = True
+            try:
+                self.win.grab_release()
+            except Exception:
+                pass
+            try:
+                self.win.destroy()
+            except Exception:
+                pass
+        return
+
+
 def _resolve_parent(parent):
     """没有显式 parent 时用 Tk 默认根窗口。"""
     result = parent

@@ -65,21 +65,8 @@ class ParamsMixin(object):
             "<MouseWheel>", self._on_params_mousewheel))
         scroll.bind("<Leave>", lambda e: scroll.unbind_all("<MouseWheel>"))
 
-        # 当前生效参数值
-        current = {
-            "YUNET_SCORE_THRESHOLD": cfg.YUNET_SCORE_THRESHOLD,
-            "MIN_FACE_SIZE": cfg.MIN_FACE_SIZE,
-            "SKIN_FILTER_ENABLED": cfg.SKIN_FILTER_ENABLED,
-            "SKIN_MIN_SIZE": cfg.SKIN_MIN_SIZE,
-            "SKIN_RATIO_THRESHOLD": cfg.SKIN_RATIO_THRESHOLD,
-            "CONFIRM_FRAMES": cfg.CONFIRM_FRAMES,
-            "LOST_FRAMES": cfg.LOST_FRAMES,
-            "FACIAL_LANDMARK_CHECK": cfg.FACIAL_LANDMARK_CHECK,
-            "LANDMARK_MIN_POINTS": cfg.LANDMARK_MIN_POINTS,
-            "SCRFD_THRESHOLD": cfg.SCRFD_THRESHOLD,
-            "PREPROCESS_RESIZE_ENABLED": cfg.PREPROCESS_RESIZE_ENABLED,
-            "PREPROCESS_RESIZE_WIDTH": cfg.PREPROCESS_RESIZE_WIDTH,
-        }
+        # 当前生效参数值：按 PARAM_DEFS 从 settings 实时读取，新增参数无需再手写一份键列表
+        current = {p["key"]: getattr(cfg, p["key"]) for p in PARAM_DEFS}
         self._param_vars = {}
         self._param_bool_btns = {}   # 布尔参数的「开/关」按钮引用（恢复默认值时同步样式）
         self._param_choice_val2label = {}  # choice 参数的 (label2val, val2label) 映射
@@ -270,6 +257,10 @@ class ParamsMixin(object):
             persist.update(new_params)
             save_config(persist)
             self._sync_skin_btn()
+            # 涂抹开关变化时，脱敏视频的马赛克框按钮立刻变成可设 / 禁用
+            if hasattr(self, "view_dst"):
+                self.view_dst._sync_mosaic_btn()
+                self.view_dst._refresh_overlay()
             self._clear_videos()   # 参数已变，清空旧视频数据，让用户用新参数重新分析
             messagebox.showinfo("成功", "参数已保存，请重新导入视频进行分析。",
                                 parent=self.root)
@@ -303,6 +294,7 @@ class ParamsMixin(object):
             self.view_dst.video_path = None
             self.view_dst.total_frames = 0
             self.view_dst.face_boxes_by_frame = {}
+            self.view_dst.mosaic_rects_by_frame = {}
             self.view_dst.btn_play.config(state=tk.DISABLED, text="播放", bg=BG_HOVER, fg=FG)
             self.view_dst._paint_canvas_bg()
             self.view_dst.lbl_info.config(text="未导入视频")
@@ -315,6 +307,7 @@ class ParamsMixin(object):
         self.check_progress.config(value=0)
         self.lbl_check_state.config(text="检测进度：未开始")
         self._set_desens_result("")
+        self._drop_desens_report()
 
     def _restore_param_defaults(self):
         """把参数控件填回默认值（不立即保存，等用户点保存）。"""

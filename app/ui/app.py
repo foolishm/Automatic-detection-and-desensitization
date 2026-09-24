@@ -29,7 +29,7 @@ class FaceVideoApp(TitlebarMixin, ParamsMixin, DesensMixin, PipelineMixin):
     def __init__(self, root):
         self.root = root
         root.title("人脸检测视频工具")
-        root.geometry("1120x720")
+        root.geometry("1280x720")
         root.minsize(900, 600)
         root.configure(bg=BG)
 
@@ -106,6 +106,10 @@ class FaceVideoApp(TitlebarMixin, ParamsMixin, DesensMixin, PipelineMixin):
         # 脱敏率检测进度
         self._check_progress = 0        # 检测进度(0-1)，检测线程写，主线程轮询读
         self._check_total = 0           # 检测的应脱敏帧总数
+        self.last_desens_report = None  # 最近一次成功检测的冻结结果，供导出报告
+        self._desens_report_gen = 0     # 冻结结果代次；重新导入或清空时递增，旧结果作废
+        self._report_save_gen = 0       # 报告保存代次，避免上一次轮询吃掉这一次的结果
+        self._report_save_box = None    # 子线程写入的保存结果，主线程轮询读取
         self._top_drop_cb = None
         self._pending_drop_paths = None
         self._pending_drop_bad = False
@@ -183,10 +187,11 @@ class FaceVideoApp(TitlebarMixin, ParamsMixin, DesensMixin, PipelineMixin):
             config_key="show_boxes_src", padx=(0, 10))
         self.view_dst = VideoView(
             vids, "脱敏视频", self.import_dst_video,
-            config_key="show_boxes_dst", padx=(0, 0))
+            config_key="show_boxes_dst", padx=(0, 0),
+            mosaic_toggle=True)   # 只有脱敏视频检测马赛克，才有马赛克框开关
 
         # 右侧：滚动列表（脱敏检测信息）
-        right = tk.Frame(body, bg=BG_CARD, width=320,
+        right = tk.Frame(body, bg=BG_CARD, width=460,
                          highlightthickness=1, highlightbackground=BORDER)
         right.pack(side=tk.RIGHT, fill=tk.Y, padx=(12, 0))
         right.pack_propagate(False)
@@ -203,6 +208,10 @@ class FaceVideoApp(TitlebarMixin, ParamsMixin, DesensMixin, PipelineMixin):
         self._scroll_content.bind("<Configure>", self._sync_desens_panel)
         scroll_canvas.bind("<Configure>", self._sync_desens_panel)
         scroll_canvas.configure(yscrollcommand=scrollbar.set)
+        # 漏帧列表在栏底，不放进上方 Canvas，避免两层滚动抢滚轮
+        miss_host = tk.Frame(right, bg=BG_CARD)
+        miss_host.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
+        self._build_miss_list(miss_host)
         scroll_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
@@ -227,7 +236,10 @@ class FaceVideoApp(TitlebarMixin, ParamsMixin, DesensMixin, PipelineMixin):
 
         self.btn_check_desens = self._make_btn(self._scroll_content, "开始检测脱敏率",
                                                self.check_desensitization_ui, accent=True)
-        self.btn_check_desens.pack(fill=tk.X, padx=16, pady=(2, 10))
+        self.btn_check_desens.pack(fill=tk.X, padx=16, pady=(2, 6))
+        self.btn_export_report = self._make_btn(self._scroll_content, "生成检测报告",
+                                                self.export_desens_report, disabled=True)
+        self.btn_export_report.pack(fill=tk.X, padx=16, pady=(0, 10))
 
         # 检测进度条
         self.lbl_check_state = tk.Label(self._scroll_content, text="检测进度：未开始",
@@ -244,12 +256,15 @@ class FaceVideoApp(TitlebarMixin, ParamsMixin, DesensMixin, PipelineMixin):
         formula_box.pack(fill=tk.X, padx=16, pady=(0, 12))
         self.lbl_formula = tk.Label(
             formula_box,
-            text="脱敏率 = 已脱敏帧数 ÷ 应脱敏帧数 × 100%\n"
-                 "应脱敏帧数 = 原视频检出人脸的帧数\n"
-                 "已脱敏帧数 = 对齐后(检不出人脸 + 存在马赛克)的帧数\n"
-                 "（帧率不同时按时间戳对齐：帧号÷帧率 = 时间）",
+            text="脱敏率 = 已脱敏人脸数 ÷ 帧率换算后原视频应脱敏人脸数 × 100%\n"
+                 "换算公式：脱敏帧号 = round(原帧号 ÷ 原帧率 × 脱敏帧率) + 帧偏移\n"
+                 "原视频人脸数、脱敏视频人脸数 = 换算前各自检出的总数\n"
+                 "帧率换算后原视频应脱敏人脸数 = 落在脱敏视频时长内的原视频人脸数\n"
+                 "帧率换算后脱敏视频检测出人脸数 = 对上的脱敏帧检出人脸数，同一帧只计一次\n"
+                 "帧数用同一套名称：原视频人脸帧数、脱敏视频人脸帧数、"
+                 "帧率换算后原视频应脱敏帧数、帧率换算后脱敏视频检测出帧数",
             bg=BG_PANEL, fg=FG_MUTED, font=("Microsoft YaHei UI", 8),
-            anchor="w", justify="left")
+            anchor="w", justify="left", wraplength=400)
         self.lbl_formula.pack(fill=tk.X, padx=10, pady=8)
 
         # 检测结果（标题 + 结果框）
@@ -263,6 +278,10 @@ class FaceVideoApp(TitlebarMixin, ParamsMixin, DesensMixin, PipelineMixin):
                                      font=("Consolas", 9),
                                      highlightthickness=1, highlightbackground=BORDER)
         self.desens_result.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 16))
+        self._desens_right = right
+        self._hook_right_wheel(right)
+        # 结果框自己的滚轮绑定会先吃掉事件，这里改滚上方 Canvas 并拦住
+        self.desens_result.bind("<MouseWheel>", self._on_right_mousewheel)
 
         # ===== 参数设置页 =====
         self.page_params = tk.Frame(self.page_container, bg=BG)
@@ -300,6 +319,66 @@ class FaceVideoApp(TitlebarMixin, ParamsMixin, DesensMixin, PipelineMixin):
         canvas.itemconfigure(self._scroll_window, height=use_h)
         canvas.configure(scrollregion=(0, 0, view_w, use_h))
         return
+
+    def _hook_right_wheel(self, widget):
+        """右侧栏里每个控件进出时接上滚轮。子控件盖住父控件时，只绑父控件收不到进入事件。"""
+        widget.bind("<Enter>", self._arm_right_wheel, add="+")
+        widget.bind("<Leave>", self._disarm_right_wheel, add="+")
+        for child in widget.winfo_children():
+            self._hook_right_wheel(child)
+        return
+
+    def _arm_right_wheel(self, event=None):
+        self.root.bind_all("<MouseWheel>", self._on_right_mousewheel)
+        return
+
+    def _disarm_right_wheel(self, event=None):
+        hit = self._widget_under_pointer()
+        # 还在右侧栏内部移动（例如从标题进到结果框）时保持滚轮
+        if not self._widget_is_under(hit, getattr(self, "_desens_right", None)):
+            self.root.unbind_all("<MouseWheel>")
+        return
+
+    def _widget_under_pointer(self):
+        hit = None
+        if self.root.winfo_exists():
+            hit = self.root.winfo_containing(
+                self.root.winfo_pointerx(), self.root.winfo_pointery())
+        return hit
+
+    def _widget_is_under(self, widget, ancestor):
+        found = False
+        current = widget
+        while current is not None and ancestor is not None:
+            if current == ancestor:
+                found = True
+                break
+            parent = current.winfo_parent()
+            # 到顶层就停，避免再往上找
+            if not parent:
+                current = None
+            else:
+                current = current.nametowidget(parent)
+        return found
+
+    def _on_right_mousewheel(self, event):
+        """指针在漏帧列表上滚列表，在上方统计区滚那一块 Canvas。一屏放得下则不动。"""
+        hit = self._widget_under_pointer()
+        miss_host = getattr(self, "_miss_host", None)
+        canvas = getattr(self, "_desens_canvas", None)
+        if self._widget_is_under(hit, miss_host):
+            self.miss_list.yview_scroll(int(-event.delta / 120), "units")
+        elif canvas is not None and (
+                self._widget_is_under(hit, canvas)
+                or hit == getattr(self, "_desens_sbar", None)):
+            content_h = int(self._scroll_content.winfo_reqheight())
+            view_h = canvas.winfo_height()
+            # 内容不超过视口时锁在顶部，避免空滚
+            if content_h <= view_h:
+                canvas.yview_moveto(0)
+            else:
+                canvas.yview_scroll(int(-event.delta / 120), "units")
+        return "break"
 
     def show_detect_page(self):
         """切换到检测页。"""

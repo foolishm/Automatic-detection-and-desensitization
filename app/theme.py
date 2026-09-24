@@ -15,7 +15,8 @@ ACCENT = "#4f8cff"       # 主强调蓝
 ACCENT_HOVER = "#6aa1ff"
 ACCENT_GREEN = "#2ee6a8" # 成功绿
 ACCENT_RED = "#ff5c5c"   # 暂停/错误红
-ACCENT_WARN = "#e6a23c"  # 警告橙（弹窗模板 warning）
+ACCENT_WARN = "#e6a23c"
+MOSAIC_BOX_COLOR = (60, 160, 255)   # 马赛克框颜色（BGR：橙色，与绿色人脸框区分）  # 警告橙（弹窗模板 warning）
 BORDER = "#2a3244"       # 边框
 CHIP_BORDER = "#1e5c48"  # 检测器徽标描边
 

@@ -12,12 +12,14 @@ from tkinter import ttk
 import cv2
 
 from app.detect.detector import FaceDetector
+from app.detect.mosaic import checker_mosaic_masks, mask_rects, rect_shrink
+from app import settings as cfg
 from app.settings import load_config, save_config
 from app.theme import (
-    ACCENT, ACCENT_GREEN, ACCENT_HOVER, ACCENT_RED, BG_CARD, BG_HOVER,
+    ACCENT, ACCENT_GREEN, ACCENT_HOVER, ACCENT_RED, ACCENT_WARN, BG_CARD, BG_HOVER,
     BG_VIDEO, BORDER, BTN_ACCENT_BORDER, BTN_ACCENT_PRESS, BTN_GREEN_BORDER,
     BTN_GREEN_PRESS, BTN_NORMAL_BORDER, BTN_NORMAL_HOVER, BTN_NORMAL_PRESS, FG,
-    FG_FAINT, FG_MUTED,
+    FG_FAINT, FG_MUTED, MOSAIC_BOX_COLOR,
 )
 from app.ui.drop import _hdrop_paths, _warn_drop_not_video, pick_dropped_video
 from app.video.formats import (
@@ -33,10 +35,12 @@ class VideoView:
     独立维护自己的 VideoCapture 和播放线程，用于原视频/脱敏视频的比对预览。
     """
 
-    def __init__(self, parent, title, on_import, config_key="show_boxes", padx=(0, 10)):
+    def __init__(self, parent, title, on_import, config_key="show_boxes", padx=(0, 10),
+                 mosaic_toggle=False):
         self.title = title
         self.on_import = on_import  # 导入按钮回调（由主程序注入）
         self.config_key = config_key  # 配置持久化的键名（每个开关单独记录）
+        self.mosaic_toggle = mosaic_toggle  # 是否提供「马赛克框」开关（只有脱敏视频需要）
         self.video_path = None
         self.cap = None
         self.total_frames = 0
@@ -54,6 +58,9 @@ class VideoView:
         self._decode_idx = -1        # 当前 cap 实际解到的帧号（顺序计数）
         self._cap_lock = threading.Lock()
         self._seek_gen = 0           # 暂停态跳转代次，新拖动作废旧线程
+        self._exact_loading = False  # 列表精确跳转进行中，画面显示「加载中」
+        self._queued_exact_gen = 0   # 显示队列里精确帧所属的代次
+        self._exact_lock = threading.Lock()
         self._tk_image = None
         self._last_frame = None      # 最近显示的原始帧（用于窗口缩放时重绘）
         self._last_cw = 0            # 上次渲染时的 canvas 宽度
@@ -63,6 +70,11 @@ class VideoView:
         # 检测框显示开关 + 人脸框数据（帧号 -> boxes，由主程序在预处理完成后注入）
         self.show_boxes = bool(load_config().get(self.config_key, True))
         self.face_boxes_by_frame = {}
+        # 马赛克框显示开关 + 马赛克矩形数据（帧号 -> rects，由主程序在预处理时注入）
+        self.mosaic_config_key = self.config_key + "_mosaic"
+        self.show_mosaic = (self.mosaic_toggle
+                            and bool(load_config().get(self.mosaic_config_key, True)))
+        self.mosaic_rects_by_frame = {}
         self._index_trusted = True   # True=顺序解码，帧号与预处理一致；cap.set 之后必须改 False
         self._frame_idx = 0          # 当前画面对应的播放帧号（进度条用）
         self._overlay_det = None     # 现场画框用的检测器（跳转后 POS 不可信时使用）
@@ -109,6 +121,17 @@ class VideoView:
         self.btn_boxes.pack(side=tk.RIGHT, padx=(0, 8))
         self._sync_boxes_btn()
 
+        # 显示马赛克框：只有脱敏视频窗口有这个开关（原视频不检测马赛克）
+        self.btn_mosaic = None
+        if self.mosaic_toggle:
+            self.btn_mosaic = tk.Button(
+                head, command=self._on_mosaic_toggle,
+                relief=tk.FLAT, cursor="hand2",
+                font=("Microsoft YaHei UI", 9), padx=10, pady=3,
+                bd=0, highlightthickness=1)
+            self.btn_mosaic.pack(side=tk.RIGHT, padx=(0, 8))
+            self._sync_mosaic_btn()
+
         # 画面区：面板尺寸由父布局分配，不随图片请求尺寸膨胀
         self.video_panel = tk.Frame(self.frame, bg=BG_VIDEO)
         self.video_panel.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 4))
@@ -124,6 +147,10 @@ class VideoView:
             bg=BG_VIDEO, fg=FG_MUTED,
             font=("Microsoft YaHei UI", 10))
         self.lbl_drop_hint.place(relx=0.5, rely=0.5, anchor="center")
+        self.lbl_loading = tk.Label(
+            self.video_panel, text="加载中",
+            bg=BG_VIDEO, fg=FG_MUTED,
+            font=("Microsoft YaHei UI", 12))
         self._drop_hooks = []       # [(hwnd, old_proc, wndproc)]，必须持有回调防 GC
         self._pending_drop_path = None   # WndProc 里只记路径，主循环再导入
         self._pending_drop_bad = False
@@ -166,14 +193,26 @@ class VideoView:
         need_redraw = False
         try:
             frame = self._display_q.get_nowait()
-            self._show(frame)
-            # 按住进度条时不要用播放位置覆盖滑块和时间
-            if not self._scrubbing:
-                self._update_progress(self._display_pos)
-                self._update_time(self._display_pos)
+            # 精确跳转未完成时，只接受这一代的帧，旧帧不能把时间和进度条改回去
+            if self._exact_loading:
+                if self._queued_exact_gen == self._seek_gen:
+                    self._exact_loading = False
+                    self._hide_loading()
+                    self._show(frame)
+                    if not self._scrubbing:
+                        self._update_progress(self._display_pos)
+                        self._update_time(self._display_pos)
+            else:
+                self._show(frame)
+                # 按住进度条时不要用播放位置覆盖滑块和时间
+                if not self._scrubbing:
+                    self._update_progress(self._display_pos)
+                    self._update_time(self._display_pos)
         except queue.Empty:
-            # 队列空（如已暂停）：检查窗口尺寸是否变化，变了就重绘缓存帧
-            if self._last_frame is not None:
+            # 加载中不重绘旧画面；队列空时只在窗口尺寸变化后重绘缓存帧
+            if self._exact_loading:
+                pass
+            elif self._last_frame is not None:
                 cw, ch = self._alloc_size()
                 if cw != self._last_cw or ch != self._last_ch:
                     need_redraw = True
@@ -267,6 +306,55 @@ class VideoView:
                 highlightcolor=BTN_NORMAL_BORDER)
         return
 
+    def mosaic_detect_enabled(self):
+        """参数页「预处理涂抹马赛克」打开时才检测、显示马赛克框。"""
+        return bool(self.mosaic_toggle and cfg.MOSAIC_MASK_ENABLED)
+
+    def _on_mosaic_toggle(self):
+        """马赛克框开关切换：更新状态并持久化到配置文件。"""
+        # 涂抹关闭时按钮禁用，忽略点击
+        if self.mosaic_detect_enabled():
+            self.show_mosaic = not self.show_mosaic
+            self._sync_mosaic_btn()
+            persist = load_config()
+            persist[self.mosaic_config_key] = self.show_mosaic
+            save_config(persist)
+            self._refresh_overlay()
+        return
+
+    def _sync_mosaic_btn(self):
+        """同步马赛克框按钮：涂抹关则禁用；涂抹开则恢复用户上次的开/关外观。"""
+        if self.btn_mosaic is None:
+            pass
+        elif not self.mosaic_detect_enabled():
+            # 参数关掉涂抹：框不可设置，也不画
+            self.show_mosaic = False
+            self.btn_mosaic.config(
+                text="马赛克框：关", state=tk.DISABLED, cursor="arrow",
+                bg=BG_HOVER, fg=FG_FAINT, disabledforeground=FG_FAINT,
+                activebackground=BG_HOVER, activeforeground=FG_FAINT,
+                highlightbackground=BTN_NORMAL_BORDER,
+                highlightcolor=BTN_NORMAL_BORDER)
+        else:
+            # 刚从「不可设置」恢复时，读回用户上次的显示偏好
+            if str(self.btn_mosaic["state"]) == tk.DISABLED:
+                self.show_mosaic = bool(load_config().get(self.mosaic_config_key, True))
+            self.btn_mosaic.config(state=tk.NORMAL, cursor="hand2")
+            # 开启为橙色，与画面里的橙色马赛克框对应
+            if self.show_mosaic:
+                self.btn_mosaic.config(
+                    text="马赛克框：开", bg=ACCENT_WARN, fg="#1a1204",
+                    activebackground=ACCENT_WARN, activeforeground="#1a1204",
+                    highlightbackground=ACCENT_WARN,
+                    highlightcolor=ACCENT_WARN)
+            else:
+                self.btn_mosaic.config(
+                    text="马赛克框：关", bg=BG_HOVER, fg=FG_MUTED,
+                    activebackground=BTN_NORMAL_HOVER, activeforeground="#ffffff",
+                    highlightbackground=BTN_NORMAL_BORDER,
+                    highlightcolor=BTN_NORMAL_BORDER)
+        return
+
     def _get_overlay_detector(self):
         """惰性创建现场画框检测器；创建失败则返回 None。"""
         det = self._overlay_det
@@ -312,7 +400,32 @@ class VideoView:
                 # 刚拖进度条 / 该帧缓存还没有：按当前画面检测
                 det = self._get_overlay_detector()
                 if det is not None:
-                    out, _ = det.detect_and_draw(frame.copy())
+                    # 与预处理口径一致：只有带马赛克开关的脱敏视频窗口才做马赛克涂抹
+                    out, _ = det.detect_and_draw(frame.copy(),
+                                                 skip_mosaic=not self.mosaic_detect_enabled())
+        out = self._draw_mosaic_rects(out, frame, frame_idx)
+        return out
+
+    def _draw_mosaic_rects(self, out, raw, frame_idx):
+        """若马赛克框开关开启，在 out 上画橙色马赛克框（rects 来自预处理记录，缺失时现算）。"""
+        if self.show_mosaic:
+            rects = None
+            # 顺序解码且帧号可信：用预处理记录
+            if self._index_trusted and frame_idx is not None and frame_idx >= 0:
+                rects = self.mosaic_rects_by_frame.get(frame_idx, [])
+            # 跳转后帧号不可信：按当前像素现算棋盘格位置（用紧掩码，框贴合马赛克）
+            if rects is None:
+                _paint, tight = checker_mosaic_masks(raw)
+                rects = mask_rects(tight, shrink=rect_shrink())
+            if rects:
+                # out 可能仍是原帧本身，先复制再画，避免污染 _last_raw
+                if out is raw:
+                    out = raw.copy()
+                for i, (x, y, w, h) in enumerate(rects, start=1):
+                    cv2.rectangle(out, (x, y), (x + w, y + h), MOSAIC_BOX_COLOR, BOX_THICKNESS)
+                    cv2.putText(out, f"Mosaic {i}", (x, min(y + h + 16, out.shape[0] - 4)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, MOSAIC_BOX_COLOR, 2,
+                                cv2.LINE_AA)
         return out
 
     def play(self):
@@ -327,6 +440,92 @@ class VideoView:
         self.playing = False
         self._stop.set()
         self.btn_play.config(text="播放", bg=BG_HOVER, fg=FG)
+
+    def show_frame(self, frame_idx):
+        """暂停并精确显示第 frame_idx 帧。时间和进度条立刻过去，画面先显示「加载中」。"""
+        shown = False
+        if self.cap is not None and frame_idx is not None and int(frame_idx) >= 0:
+            target = int(frame_idx)
+            self.pause()
+            with self._exact_lock:
+                self._seek_gen += 1
+                gen = self._seek_gen
+                self._exact_loading = True
+                self._seek_pending = None
+            self._frame_idx = target
+            self._update_progress(target)
+            self._update_time(target)
+            self._clear_display_q()
+            self._show_loading()
+            threading.Thread(
+                target=self._exact_seek_loop, args=(gen, target),
+                daemon=True).start()
+            shown = True
+        return shown
+
+    def cancel_show_frame(self):
+        """停掉尚未完成的精确跳转，不再改画面。"""
+        with self._exact_lock:
+            self._seek_gen += 1
+            self._exact_loading = False
+        self._clear_display_q()
+        self._hide_loading()
+        return
+
+    def _show_loading(self):
+        """清掉当前画面，中间写「加载中」。"""
+        self._last_frame = None
+        self._paint_canvas_bg()
+        self._set_drop_hint_visible(False)
+        self.lbl_loading.place(relx=0.5, rely=0.5, anchor="center")
+        self.lbl_loading.lift()
+        return
+
+    def _hide_loading(self):
+        if getattr(self, "lbl_loading", None) is not None:
+            self.lbl_loading.place_forget()
+        return
+
+    def _clear_display_q(self):
+        try:
+            while True:
+                self._display_q.get_nowait()
+        except queue.Empty:
+            pass
+        return
+
+    def _exact_seek_loop(self, gen, target):
+        """顺序解码到目标帧。不调用 Tk，完成的帧交给主线程定时器。"""
+        frame = None
+        ok = False
+        idx = target
+        with self._cap_lock:
+            # 代次变了说明用户又点了别的行或拖了进度条
+            if gen == self._seek_gen and self.cap is not None:
+                if target == self._decode_idx and self._last_raw is not None:
+                    ok = True
+                    frame = self._last_raw
+                    idx = self._decode_idx
+                else:
+                    # 强制顺序解码，不用 cap.set，避免停在附近关键帧
+                    self.cap, self._decode_idx, ok, frame = decode_seek(
+                        self.cap, self.video_path, self._decode_idx,
+                        target, True)
+                    if ok:
+                        idx = self._decode_idx
+                        self._index_trusted = True
+                        self._frame_idx = idx
+                        if frame is not None:
+                            frame = frame.copy()
+                        self._last_raw = frame
+                        frame = self._draw_boxes(frame, idx)
+        if ok and frame is not None:
+            with self._exact_lock:
+                # 解码期间又发起了新跳转，这一帧丢掉
+                if gen == self._seek_gen:
+                    self._queued_exact_gen = gen
+                    self._push_display(frame, idx)
+        return
 
     def _play_loop(self):
         delay = 1.0 / self.fps if self.fps > 0 else 0.04
@@ -408,6 +607,13 @@ class VideoView:
 
     def _on_scrub_press(self, event=None):
         self._scrubbing = True
+        # 加载中改拖进度条：这次列表跳转作废，后面仍走进度条原来的跳转
+        if self._exact_loading:
+            with self._exact_lock:
+                self._seek_gen += 1
+                self._exact_loading = False
+            self._clear_display_q()
+            self._hide_loading()
         # 指针拖出进度条再松手也要收到 Release，否则 _scrubbing 会一直为 True
         if not self._scrub_bound:
             self.frame.bind_all("<ButtonRelease-1>", self._on_scrub_release)
@@ -524,6 +730,10 @@ class VideoView:
         cw, ch = self._alloc_size()
         # 尺寸没变则不必重绘，避免 Configure 循环
         if cw == self._last_cw and ch == self._last_ch:
+            return
+        # 精确跳转未完成：保持「加载中」，不要把旧帧缩回来
+        if self._exact_loading:
+            self._show_loading()
             return
         # 有画面则按新尺寸缩放；无画面则铺实心底
         if self._last_frame is None:
@@ -675,7 +885,10 @@ class VideoView:
         self._frame_idx = 0
         self._decode_idx = -1
         self._seek_pending = None
-        self._seek_gen += 1
+        with self._exact_lock:
+            self._seek_gen += 1
+            self._exact_loading = False
+        self._hide_loading()
         self._scrubbing = False
         if self._scrub_bound:
             try:
